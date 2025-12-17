@@ -1,14 +1,18 @@
-name: Video Processor and Publisher
+name: Telegram Video Download and Processor
 
 on:
   workflow_dispatch:
     inputs:
-      video_url:
-        description: 'Direct download URL of the video'
+      encoded_file_info:
+        description: 'Base64 encoded Telegram file info'
+        required: true
+        type: string
+      file_hash:
+        description: 'File hash for metadata'
         required: true
         type: string
       playback_speed:
-        description: 'Desired playback speed (e.g., 1.5 for 1.5x)'
+        description: 'Desired playback speed'
         required: true
         type: number
         default: 1.5
@@ -30,65 +34,169 @@ permissions:
   contents: write
 
 jobs:
-  process-video:
+  download-and-process:
     runs-on: ubuntu-latest-16core
     timeout-minutes: 360
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Install required packages
       run: |
         sudo apt-get update
-        sudo apt-get install -y ffmpeg wget bc jq
+        sudo apt-get install -y ffmpeg wget bc jq curl python3-pip
 
     - name: Install Python dependencies
       run: |
         python3 -m pip install --upgrade pip
-        pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
+        pip install telethon requests google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-    - name: Extract filename from URL
-      shell: bash
+    - name: Decode file information
       run: |
-        FILENAME=$(basename "${{ github.event.inputs.video_url }}" | cut -d'?' -f1)
-        if [[ ! "$FILENAME" =~ \.(mp4|avi|mov|mkv|flv|webm|mpeg|mpg|wmv|3gp)$ ]]; then
-          FILENAME="video.mp4"
+        echo "${{ github.event.inputs.encoded_file_info }}" > encoded.txt
+        python3 -c "
+        import base64, json, sys
+        encoded = open('encoded.txt').read().strip()
+        decoded = base64.urlsafe_b64decode(encoded + '=' * (4 - len(encoded) % 4))
+        file_info = json.loads(decoded)
+        print('File ID:', file_info['id'])
+        print('Size:', file_info['size'])
+        print('DC ID:', file_info['dc_id'])
+        with open('file_info.json', 'w') as f:
+            json.dump(file_info, f, indent=2)
+        "
+        
+        echo "FILE_INFO_JSON=$(cat file_info.json | jq -c .)" >> $GITHUB_ENV
+
+    - name: Create Telethon download script
+      run: |
+        cat > download_telegram.py << 'EOF'
+        import asyncio
+        import sys
+        import json
+        from telethon.sessions import StringSession
+        from telethon import TelegramClient
+        import os
+        
+        async def main():
+            # Read file info
+            with open('file_info.json', 'r') as f:
+                file_info = json.load(f)
+            
+            # Get Telegram credentials from environment
+            api_id = int(os.getenv('TELEGRAM_API_ID', '123456'))
+            api_hash = os.getenv('TELEGRAM_API_HASH', '')
+            session_string = os.getenv('TELEGRAM_SESSION_STRING', '')
+            
+            if not all([api_id, api_hash, session_string]):
+                print("❌ Missing Telegram credentials in workflow")
+                sys.exit(1)
+            
+            # Create client
+            client = TelegramClient(
+                StringSession(session_string),
+                api_id,
+                api_hash
+            )
+            
+            await client.start()
+            
+            try:
+                # Construct InputDocument
+                from telethon.tl.types import InputDocument
+                from telethon.tl.functions.upload import GetFileRequest
+                from telethon.tl.types import InputDocumentFileLocation
+                
+                # Create document location
+                doc = InputDocument(
+                    id=file_info['id'],
+                    access_hash=file_info['access_hash'],
+                    file_reference=bytes.fromhex(file_info['file_reference']) if file_info['file_reference'] else b''
+                )
+                
+                # Download the file
+                filename = file_info['file_name'] or 'video.mp4'
+                print(f"📥 Downloading {filename} ({file_info['size']} bytes)...")
+                
+                # Use download_media which handles chunking
+                import time
+                start_time = time.time()
+                
+                def progress_callback(current, total):
+                    percent = (current / total) * 100
+                    mb_current = current / (1024*1024)
+                    mb_total = total / (1024*1024)
+                    elapsed = time.time() - start_time
+                    if elapsed > 0:
+                        speed = mb_current / elapsed
+                        eta = (mb_total - mb_current) / speed if speed > 0 else 0
+                        print(f"\rProgress: {percent:.1f}% ({mb_current:.1f}/{mb_total:.1f} MB) | Speed: {speed:.1f} MB/s | ETA: {eta:.0f}s", end='')
+                
+                downloaded = await client.download_media(
+                    doc,
+                    file=filename,
+                    progress_callback=progress_callback
+                )
+                
+                print(f"\n✅ Download complete: {downloaded}")
+                
+                # Verify file size
+                import os
+                actual_size = os.path.getsize(filename)
+                expected_size = file_info['size']
+                
+                if actual_size == expected_size:
+                    print(f"✅ Size verified: {actual_size} bytes")
+                else:
+                    print(f"⚠️ Size mismatch: expected {expected_size}, got {actual_size}")
+                
+            finally:
+                await client.disconnect()
+        
+        if __name__ == '__main__':
+            asyncio.run(main())
+        EOF
+
+    - name: Download from Telegram using Telethon
+      env:
+        TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+        TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+      run: |
+        python3 download_telegram.py
+        
+        # Check if download succeeded
+        if [ -f "video.mp4" ] || [ -f "$(ls *.mp4 2>/dev/null | head -1)" ]; then
+          MP4_FILE=$(ls *.mp4 2>/dev/null | head -1)
+          echo "VIDEO_FILE=$MP4_FILE" >> $GITHUB_ENV
+          echo "✅ Downloaded: $MP4_FILE"
+          echo "📊 Size: $(ls -lh "$MP4_FILE" | awk '{print $5}')"
+        else
+          echo "❌ No video file found after download"
+          exit 1
         fi
-        echo "ORIGINAL_FILENAME=$FILENAME" >> $GITHUB_ENV
-        echo "BASE_FILENAME=${FILENAME%.*}" >> $GITHUB_ENV
-        PROCESSED_FILENAME="${FILENAME%.*}_${{ github.event.inputs.playback_speed }}x.mp4"
-        echo "PROCESSED_FILENAME=$PROCESSED_FILENAME" >> $GITHUB_ENV
-      
-    - name: Download video from provided URL
-      run: |
-        echo "Downloading from: ${{ github.event.inputs.video_url }}"
-        wget --no-check-certificate -O "$ORIGINAL_FILENAME" "${{ github.event.inputs.video_url }}"
-        echo "Downloaded file size: $(ls -lh "$ORIGINAL_FILENAME" | awk '{print $5}')"
-        echo "File type: $(file "$ORIGINAL_FILENAME")"
 
-    - name: Get video duration
+    - name: Process video (same as before)
       run: |
-        DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$ORIGINAL_FILENAME" | cut -d'.' -f1)
+        # Extract filename without extension
+        BASENAME="${VIDEO_FILE%.*}"
+        echo "BASE_FILENAME=$BASENAME" >> $GITHUB_ENV
+        
+        # Get video duration
+        DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" | cut -d'.' -f1)
         echo "TOTAL_DURATION=$DURATION" >> $GITHUB_ENV
-        echo "Total video duration: $DURATION seconds"
-
-    - name: Prepare split points
-      shell: bash
-      run: |
-        # Check if split_timestamps is empty
-        if [ -z "${{ github.event.inputs.split_timestamps }}" ] || [ "${{ github.event.inputs.split_timestamps }}" = "" ]; then
-          echo "No split timestamps provided. Processing entire video as one part."
-          echo "SPLIT_POINTS=0,$TOTAL_DURATION" >> $GITHUB_ENV
+        
+        # Prepare split points
+        if [ -z "${{ github.event.inputs.split_timestamps }}" ]; then
+          echo "SPLIT_POINTS=0,$DURATION" >> $GITHUB_ENV
           echo "PART_COUNT=1" >> $GITHUB_ENV
         else
-          # Convert timestamps to seconds and add start/end points
+          # Convert timestamps to seconds
           IFS=',' read -ra TIMESTAMPS <<< "${{ github.event.inputs.split_timestamps }}"
-          
-          # Add start point (0 seconds)
           SPLIT_POINTS="0"
-          
-          # Convert HH:MM:SS to seconds
           for timestamp in "${TIMESTAMPS[@]}"; do
             IFS=':' read -ra TIME <<< "$timestamp"
             HOURS=${TIME[0]:-0}
@@ -97,16 +205,11 @@ jobs:
             TOTAL_SECONDS=$((HOURS * 3600 + MINUTES * 60 + SECONDS))
             SPLIT_POINTS="$SPLIT_POINTS,$TOTAL_SECONDS"
           done
-          
-          # Add end point (total duration)
-          SPLIT_POINTS="$SPLIT_POINTS,$TOTAL_DURATION"
-          
+          SPLIT_POINTS="$SPLIT_POINTS,$DURATION"
           echo "SPLIT_POINTS=$SPLIT_POINTS" >> $GITHUB_ENV
-          echo "Split points in seconds: $SPLIT_POINTS"
         fi
-
-    - name: Split video into parts
-      run: |
+        
+        # Split video
         IFS=',' read -ra POINTS <<< "$SPLIT_POINTS"
         PART_COUNT=0
         
@@ -116,33 +219,27 @@ jobs:
           
           if (( $(echo "$END > $START" | bc -l) )); then
             PART_COUNT=$((PART_COUNT + 1))
-            OUTPUT_FILE="${BASE_FILENAME}_part${PART_COUNT}.mp4"
+            OUTPUT_FILE="${BASENAME}_part${PART_COUNT}.mp4"
             
             echo "Splitting part $PART_COUNT: $START to $END seconds"
-            
-            ffmpeg -i "$ORIGINAL_FILENAME" \
-              -ss "$START" -to "$END" \
-              -c copy \
-              "$OUTPUT_FILE"
+            ffmpeg -i "$VIDEO_FILE" -ss "$START" -to "$END" -c copy "$OUTPUT_FILE"
           fi
         done
         
         echo "PART_COUNT=$PART_COUNT" >> $GITHUB_ENV
-        echo "Created $PART_COUNT video parts"
-        
-    - name: Process each part with speed adjustment
+
+    - name: Apply speed adjustment
       run: |
+        SPEED=${{ github.event.inputs.playback_speed }}
+        
         for i in $(seq 1 $PART_COUNT); do
           INPUT_FILE="${BASE_FILENAME}_part${i}.mp4"
-          OUTPUT_FILE="${BASE_FILENAME}_part${i}_${{ github.event.inputs.playback_speed }}x.mp4"
+          OUTPUT_FILE="${BASE_FILENAME}_part${i}_${SPEED}x.mp4"
           
-          echo "Processing part $i: $INPUT_FILE at ${{ github.event.inputs.playback_speed }}x speed"
+          echo "Processing part $i at ${SPEED}x"
           
-          SPEED=${{ github.event.inputs.playback_speed }}
-          
-          # Calculate audio filter for speed adjustment
+          # Calculate audio filter
           if (( $(echo "$SPEED > 2.0" | bc -l) )); then
-            # For speeds > 2.0, use multiple atempo filters
             ATEMPO_FILTERS=""
             TEMP_SPEED=$SPEED
             while (( $(echo "$TEMP_SPEED > 2.0" | bc -l) )); do
@@ -151,7 +248,6 @@ jobs:
             done
             ATEMPO_FILTERS="${ATEMPO_FILTERS}atempo=$TEMP_SPEED"
           elif (( $(echo "$SPEED < 0.5" | bc -l) )); then
-            # For speeds < 0.5, use multiple atempo filters
             ATEMPO_FILTERS=""
             TEMP_SPEED=$SPEED
             while (( $(echo "$TEMP_SPEED < 0.5" | bc -l) )); do
@@ -168,20 +264,15 @@ jobs:
           ffmpeg -i "$INPUT_FILE" \
             -filter_complex "[0:v]setpts=${PTS_FACTOR}*PTS[v];[0:a]${ATEMPO_FILTERS}[a]" \
             -map "[v]" -map "[a]" \
-            -c:v libx264 -profile:v main -level 4.0 \
-            -pix_fmt yuv420p -preset medium -crf 23 \
+            -c:v libx264 -preset medium -crf 23 \
             -c:a aac -b:a 128k \
             -movflags +faststart \
             "$OUTPUT_FILE"
-
-          echo "Processed part $i: $(ls -lh "$OUTPUT_FILE" | awk '{print $5}')"
           
-          # Cleanup original split part
           rm -f "$INPUT_FILE"
         done
-      
-    - name: Create Release and Upload Asset
-      id: create_release
+
+    - name: Create GitHub Release
       uses: softprops/action-gh-release@v1
       with:
         tag_name: video-${{ github.run_id }}
@@ -190,38 +281,27 @@ jobs:
           Video processed at ${{ github.event.inputs.playback_speed }}x speed
           
           **Details:**
-          - Split into ${{ env.PART_COUNT }} parts
           - YouTube Title: ${{ github.event.inputs.video_title }}
-          - Split timestamps: ${{ github.event.inputs.split_timestamps || 'No splits' }}
-          
-          **Parts:**
-          ${{ env.PART_COUNT }} processed video files
-          
-          **Workflow Information:**
-          - Run ID: ${{ github.run_id }}
-          - Triggered by: ${{ github.actor }}
-          - Repository: ${{ github.repository }}
+          - Split into ${{ env.PART_COUNT }} parts
+          - Downloaded directly from Telegram
         draft: false
         prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Upload processed parts to Release
+    - name: Upload processed parts
       run: |
         for i in $(seq 1 $PART_COUNT); do
           FILE="${BASE_FILENAME}_part${i}_${{ github.event.inputs.playback_speed }}x.mp4"
-          echo "Uploading $FILE to release (size: $(ls -lh "$FILE" | awk '{print $5}'))"
+          echo "Uploading $FILE"
           
-          curl -s \
-            -X POST \
+          curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @"$FILE" \
-            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_release.outputs.id }}/assets?name=$(basename "$FILE")"
-          
-          echo "Uploaded part $i successfully"
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create-release.outputs.id }}/assets?name=$(basename "$FILE")"
         done
-        
+
         echo "Total $PART_COUNT parts uploaded to GitHub Releases"
 
     - name: Check YouTube credentials
