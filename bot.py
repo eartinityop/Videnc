@@ -1,29 +1,3 @@
-                # Provide workflow run link
-                await self.client.send_message(
-                    session['chat_id'],
-                    f"🔗 **Workflow Monitor:**\n"
-                    f"https://github.com/{GITHUB_REPO}/actions"
-                )
-            else:
-                await progress_msg.edit(f"❌ **Failed to trigger workflow:**\n{message[:500]}")
-            
-            # Cleanup
-            self.cleanup_user_session(user_id)
-            
-        except Exception as e:
-            logger.error(f"Workflow processing error: {str(e)}")
-            await progress_msg.edit(f"❌ **Error:** {str(e)[:500]}")
-            self.cleanup_user_session(user_id)
-    
-    def get_free_port(self):
-        """Get a free port number."""
-        import socket
-        sock = socket.socket()
-        sock.bind(('', 0))
-        port = sock.getsockname()[1]
-        sock.close()
-        return port
-    
 import os
 import sys
 import asyncio
