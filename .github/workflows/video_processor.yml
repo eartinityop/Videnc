@@ -1,0 +1,386 @@
+name: Video Processor and Publisher
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'Direct download URL of the video'
+        required: true
+        type: string
+      playback_speed:
+        description: 'Desired playback speed (e.g., 1.5 for 1.5x)'
+        required: true
+        type: number
+        default: 1.5
+      split_timestamps:
+        description: 'Comma-separated timestamps for splitting (HH:MM:SS)'
+        required: false
+        type: string
+        default: ''
+      release_name:
+        description: 'Release Name'
+        required: true
+        type: string
+      video_title:
+        description: 'Title for the YouTube Video'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest-16core
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install required packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg wget bc jq
+
+    - name: Install Python dependencies
+      run: |
+        python3 -m pip install --upgrade pip
+        pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
+
+    - name: Extract filename from URL
+      shell: bash
+      run: |
+        FILENAME=$(basename "${{ github.event.inputs.video_url }}" | cut -d'?' -f1)
+        if [[ ! "$FILENAME" =~ \.(mp4|avi|mov|mkv|flv|webm|mpeg|mpg|wmv|3gp)$ ]]; then
+          FILENAME="video.mp4"
+        fi
+        echo "ORIGINAL_FILENAME=$FILENAME" >> $GITHUB_ENV
+        echo "BASE_FILENAME=${FILENAME%.*}" >> $GITHUB_ENV
+        PROCESSED_FILENAME="${FILENAME%.*}_${{ github.event.inputs.playback_speed }}x.mp4"
+        echo "PROCESSED_FILENAME=$PROCESSED_FILENAME" >> $GITHUB_ENV
+      
+    - name: Download video from provided URL
+      run: |
+        echo "Downloading from: ${{ github.event.inputs.video_url }}"
+        wget --no-check-certificate -O "$ORIGINAL_FILENAME" "${{ github.event.inputs.video_url }}"
+        echo "Downloaded file size: $(ls -lh "$ORIGINAL_FILENAME" | awk '{print $5}')"
+        echo "File type: $(file "$ORIGINAL_FILENAME")"
+
+    - name: Get video duration
+      run: |
+        DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$ORIGINAL_FILENAME" | cut -d'.' -f1)
+        echo "TOTAL_DURATION=$DURATION" >> $GITHUB_ENV
+        echo "Total video duration: $DURATION seconds"
+
+    - name: Prepare split points
+      shell: bash
+      run: |
+        # Check if split_timestamps is empty
+        if [ -z "${{ github.event.inputs.split_timestamps }}" ] || [ "${{ github.event.inputs.split_timestamps }}" = "" ]; then
+          echo "No split timestamps provided. Processing entire video as one part."
+          echo "SPLIT_POINTS=0,$TOTAL_DURATION" >> $GITHUB_ENV
+          echo "PART_COUNT=1" >> $GITHUB_ENV
+        else
+          # Convert timestamps to seconds and add start/end points
+          IFS=',' read -ra TIMESTAMPS <<< "${{ github.event.inputs.split_timestamps }}"
+          
+          # Add start point (0 seconds)
+          SPLIT_POINTS="0"
+          
+          # Convert HH:MM:SS to seconds
+          for timestamp in "${TIMESTAMPS[@]}"; do
+            IFS=':' read -ra TIME <<< "$timestamp"
+            HOURS=${TIME[0]:-0}
+            MINUTES=${TIME[1]:-0}
+            SECONDS=${TIME[2]:-0}
+            TOTAL_SECONDS=$((HOURS * 3600 + MINUTES * 60 + SECONDS))
+            SPLIT_POINTS="$SPLIT_POINTS,$TOTAL_SECONDS"
+          done
+          
+          # Add end point (total duration)
+          SPLIT_POINTS="$SPLIT_POINTS,$TOTAL_DURATION"
+          
+          echo "SPLIT_POINTS=$SPLIT_POINTS" >> $GITHUB_ENV
+          echo "Split points in seconds: $SPLIT_POINTS"
+        fi
+
+    - name: Split video into parts
+      run: |
+        IFS=',' read -ra POINTS <<< "$SPLIT_POINTS"
+        PART_COUNT=0
+        
+        for i in $(seq 0 $((${#POINTS[@]} - 2))); do
+          START=${POINTS[i]}
+          END=${POINTS[i+1]}
+          
+          if (( $(echo "$END > $START" | bc -l) )); then
+            PART_COUNT=$((PART_COUNT + 1))
+            OUTPUT_FILE="${BASE_FILENAME}_part${PART_COUNT}.mp4"
+            
+            echo "Splitting part $PART_COUNT: $START to $END seconds"
+            
+            ffmpeg -i "$ORIGINAL_FILENAME" \
+              -ss "$START" -to "$END" \
+              -c copy \
+              "$OUTPUT_FILE"
+          fi
+        done
+        
+        echo "PART_COUNT=$PART_COUNT" >> $GITHUB_ENV
+        echo "Created $PART_COUNT video parts"
+        
+    - name: Process each part with speed adjustment
+      run: |
+        for i in $(seq 1 $PART_COUNT); do
+          INPUT_FILE="${BASE_FILENAME}_part${i}.mp4"
+          OUTPUT_FILE="${BASE_FILENAME}_part${i}_${{ github.event.inputs.playback_speed }}x.mp4"
+          
+          echo "Processing part $i: $INPUT_FILE at ${{ github.event.inputs.playback_speed }}x speed"
+          
+          SPEED=${{ github.event.inputs.playback_speed }}
+          
+          # Calculate audio filter for speed adjustment
+          if (( $(echo "$SPEED > 2.0" | bc -l) )); then
+            # For speeds > 2.0, use multiple atempo filters
+            ATEMPO_FILTERS=""
+            TEMP_SPEED=$SPEED
+            while (( $(echo "$TEMP_SPEED > 2.0" | bc -l) )); do
+              ATEMPO_FILTERS="${ATEMPO_FILTERS}atempo=2.0,"
+              TEMP_SPEED=$(echo "scale=2; $TEMP_SPEED / 2.0" | bc)
+            done
+            ATEMPO_FILTERS="${ATEMPO_FILTERS}atempo=$TEMP_SPEED"
+          elif (( $(echo "$SPEED < 0.5" | bc -l) )); then
+            # For speeds < 0.5, use multiple atempo filters
+            ATEMPO_FILTERS=""
+            TEMP_SPEED=$SPEED
+            while (( $(echo "$TEMP_SPEED < 0.5" | bc -l) )); do
+              ATEMPO_FILTERS="${ATEMPO_FILTERS}atempo=0.5,"
+              TEMP_SPEED=$(echo "scale=2; $TEMP_SPEED * 2.0" | bc)
+            done
+            ATEMPO_FILTERS="${ATEMPO_FILTERS}atempo=$TEMP_SPEED"
+          else
+            ATEMPO_FILTERS="atempo=$SPEED"
+          fi
+          
+          PTS_FACTOR=$(echo "scale=5; 1 / $SPEED" | bc)
+          
+          ffmpeg -i "$INPUT_FILE" \
+            -filter_complex "[0:v]setpts=${PTS_FACTOR}*PTS[v];[0:a]${ATEMPO_FILTERS}[a]" \
+            -map "[v]" -map "[a]" \
+            -c:v libx264 -profile:v main -level 4.0 \
+            -pix_fmt yuv420p -preset medium -crf 23 \
+            -c:a aac -b:a 128k \
+            -movflags +faststart \
+            "$OUTPUT_FILE"
+
+          echo "Processed part $i: $(ls -lh "$OUTPUT_FILE" | awk '{print $5}')"
+          
+          # Cleanup original split part
+          rm -f "$INPUT_FILE"
+        done
+      
+    - name: Create Release and Upload Asset
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: video-${{ github.run_id }}
+        name: "${{ github.event.inputs.release_name }}"
+        body: |
+          Video processed at ${{ github.event.inputs.playback_speed }}x speed
+          
+          **Details:**
+          - Split into ${{ env.PART_COUNT }} parts
+          - YouTube Title: ${{ github.event.inputs.video_title }}
+          - Split timestamps: ${{ github.event.inputs.split_timestamps || 'No splits' }}
+          
+          **Parts:**
+          ${{ env.PART_COUNT }} processed video files
+          
+          **Workflow Information:**
+          - Run ID: ${{ github.run_id }}
+          - Triggered by: ${{ github.actor }}
+          - Repository: ${{ github.repository }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload processed parts to Release
+      run: |
+        for i in $(seq 1 $PART_COUNT); do
+          FILE="${BASE_FILENAME}_part${i}_${{ github.event.inputs.playback_speed }}x.mp4"
+          echo "Uploading $FILE to release (size: $(ls -lh "$FILE" | awk '{print $5}'))"
+          
+          curl -s \
+            -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$FILE" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_release.outputs.id }}/assets?name=$(basename "$FILE")"
+          
+          echo "Uploaded part $i successfully"
+        done
+        
+        echo "Total $PART_COUNT parts uploaded to GitHub Releases"
+
+    - name: Check YouTube credentials
+      id: check_youtube
+      run: |
+        if [ -n "${{ secrets.YOUTUBE_REFRESH_TOKEN }}" ] && \
+           [ -n "${{ secrets.YOUTUBE_CLIENT_ID }}" ] && \
+           [ -n "${{ secrets.YOUTUBE_CLIENT_SECRET }}" ]; then
+          echo "has_youtube=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_youtube=false" >> $GITHUB_OUTPUT
+          echo "YouTube credentials not set. Skipping YouTube upload."
+        fi
+
+    - name: Generate YouTube access token
+      if: steps.check_youtube.outputs.has_youtube == 'true'
+      run: |
+        response=$(curl -s \
+          -d "client_id=${{ secrets.YOUTUBE_CLIENT_ID }}" \
+          -d "client_secret=${{ secrets.YOUTUBE_CLIENT_SECRET }}" \
+          -d "refresh_token=${{ secrets.YOUTUBE_REFRESH_TOKEN }}" \
+          -d "grant_type=refresh_token" \
+          "https://oauth2.googleapis.com/token")
+        
+        echo "Response: $response"
+        
+        access_token=$(echo $response | jq -r '.access_token')
+        if [ "$access_token" = "null" ] || [ -z "$access_token" ]; then
+          echo "Failed to get access token"
+          echo "ACCESS_TOKEN=" >> $GITHUB_ENV
+        else
+          echo "ACCESS_TOKEN=$access_token" >> $GITHUB_ENV
+          echo "Got access token successfully"
+        fi
+
+    - name: Upload to YouTube using Python script
+      if: steps.check_youtube.outputs.has_youtube == 'true' && env.ACCESS_TOKEN != ''
+      run: |
+        # Create YouTube upload script
+        cat > youtube_upload.py << 'EOF'
+        import os
+        import sys
+        import json
+        import google.oauth2.credentials
+        import google_auth_oauthlib.flow
+        from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
+        from googleapiclient.http import MediaFileUpload
+        import argparse
+
+        def upload_video(file_path, title, description, access_token, privacy_status="private"):
+            try:
+                # Build credentials from access token
+                credentials = google.oauth2.credentials.Credentials(access_token)
+                
+                # Build YouTube API client
+                youtube = build('youtube', 'v3', credentials=credentials)
+                
+                # Create media file upload
+                media = MediaFileUpload(
+                    file_path,
+                    chunksize=-1,
+                    resumable=True,
+                    mimetype='video/mp4'
+                )
+                
+                # Create request body
+                body = {
+                    'snippet': {
+                        'title': title,
+                        'description': description,
+                        'tags': ['processed', 'telegram', 'github', 'automated']
+                    },
+                    'status': {
+                        'privacyStatus': privacy_status,
+                        'selfDeclaredMadeForKids': False
+                    }
+                }
+                
+                # Execute request
+                request = youtube.videos().insert(
+                    part=','.join(body.keys()),
+                    body=body,
+                    media_body=media
+                )
+                
+                response = request.execute()
+                print(f"✅ Uploaded video ID: {response['id']}")
+                print(f"📺 Title: {response['snippet']['title']}")
+                print(f"🔗 Link: https://youtube.com/watch?v={response['id']}")
+                return True
+                
+            except HttpError as e:
+                print(f"❌ HTTP Error: {e.resp.status} - {e.content}")
+                return False
+            except Exception as e:
+                print(f"❌ Error: {str(e)}")
+                return False
+
+        if __name__ == '__main__':
+            parser = argparse.ArgumentParser()
+            parser.add_argument('--file', required=True)
+            parser.add_argument('--title', required=True)
+            parser.add_argument('--description', required=True)
+            parser.add_argument('--access_token', required=True)
+            parser.add_argument('--privacy', default='private')
+            
+            args = parser.parse_args()
+            
+            success = upload_video(
+                args.file,
+                args.title,
+                args.description,
+                args.access_token,
+                args.privacy
+            )
+            
+            sys.exit(0 if success else 1)
+        EOF
+        
+        for i in $(seq 1 $PART_COUNT); do
+          VIDEO_FILE="${BASE_FILENAME}_part${i}_${{ github.event.inputs.playback_speed }}x.mp4"
+          
+          if [ $PART_COUNT -eq 1 ]; then
+            TITLE="${{ github.event.inputs.video_title }}"
+            DESCRIPTION="Processed at ${{ github.event.inputs.playback_speed }}x speed\nUploaded via GitHub Actions workflow"
+          else
+            TITLE="${{ github.event.inputs.video_title }} - Part $i of $PART_COUNT"
+            DESCRIPTION="Processed at ${{ github.event.inputs.playback_speed }}x speed\nPart $i of $PART_COUNT\nUploaded via GitHub Actions workflow"
+          fi
+      
+          echo "📤 Uploading part $i to YouTube..."
+          echo "📁 File: $VIDEO_FILE"
+          echo "📺 Title: $TITLE"
+      
+          python3 youtube_upload.py \
+            --file "$VIDEO_FILE" \
+            --title "$TITLE" \
+            --description "$DESCRIPTION" \
+            --access_token "$ACCESS_TOKEN" \
+            --privacy "private"
+        done
+        
+        echo "✅ YouTube upload completed for $PART_COUNT parts"
+        
+    - name: Final cleanup
+      run: |
+        # Clean up all processed files
+        rm -f "$ORIGINAL_FILENAME"
+        for i in $(seq 1 $PART_COUNT); do
+          rm -f "${BASE_FILENAME}_part${i}_${{ github.event.inputs.playback_speed }}x.mp4"
+        done
+        echo "🧹 Cleanup completed"
+        
+    - name: Send completion notification
+      if: always()
+      run: |
+        echo "🎉 Workflow completed!"
+        echo "📊 Total parts processed: $PART_COUNT"
+        echo "📺 YouTube upload: ${{ steps.check_youtube.outputs.has_youtube }}"
+        echo "📁 GitHub Release: ✅ Created"
+        echo "⏱️ Duration: ${{ job.status }}"
