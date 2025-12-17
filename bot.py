@@ -2,8 +2,6 @@ import os
 import sys
 import asyncio
 import logging
-import tempfile
-import shutil
 import json
 import requests
 import subprocess
@@ -55,105 +53,150 @@ SPEED_OPTIONS = [
 # Store user sessions
 user_sessions = {}
 
-class VideoProcessor:
+class FileMetadataHandler:
+    """Handles extraction and storage of Telegram file metadata"""
+    
     @staticmethod
-    async def process_video(input_path, output_path, speed_factor):
-        """Process video with FFmpeg."""
+    def extract_file_metadata(message):
+        """Extract all necessary metadata from Telegram message without downloading"""
         try:
-            # Create audio filter
-            def create_audio_filter(speed):
-                if speed > 2.0:
-                    atempo_filters = []
-                    remaining = speed
-                    while remaining > 2.0:
-                        atempo_filters.append("atempo=2.0")
-                        remaining /= 2.0
-                    atempo_filters.append(f"atempo={remaining:.2f}")
-                    return ",".join(atempo_filters)
-                elif speed < 0.5:
-                    atempo_filters = []
-                    remaining = speed
-                    while remaining < 0.5:
-                        atempo_filters.append("atempo=0.5")
-                        remaining *= 2.0
-                    atempo_filters.append(f"atempo={remaining:.2f}")
-                    return ",".join(atempo_filters)
-                else:
-                    return f"atempo={speed}"
+            if message.video:
+                media = message.video
+                file_name = media.file_name or "video.mp4"
+                mime_type = "video/mp4"
+            elif message.document:
+                media = message.document
+                file_name = media.file_name or "video.mp4"
+                mime_type = media.mime_type or "video/mp4"
+            else:
+                return None
             
-            audio_filter = create_audio_filter(speed_factor)
-            video_filter = f"setpts={1/speed_factor:.5f}*PTS"
+            # Get essential Telegram file identifiers
+            metadata = {
+                'file_id': media.id,
+                'access_hash': media.access_hash,
+                'file_reference': media.file_reference.hex() if media.file_reference else '',
+                'dc_id': media.dc_id,
+                'size': media.size,
+                'mime_type': mime_type,
+                'file_name': file_name,
+                'chat_id': message.chat_id,
+                'message_id': message.id,
+                'timestamp': int(time.time())
+            }
             
-            # Build FFmpeg command
-            cmd = [
-                'ffmpeg', '-i', input_path,
-                '-filter_complex', f'[0:v]{video_filter}[v];[0:a]{audio_filter}[a]',
-                '-map', '[v]', '-map', '[a]',
-                '-c:v', 'libx264', '-preset', 'medium',
-                '-crf', '23', '-c:a', 'aac',
-                '-b:a', '192k', '-movflags', '+faststart',
-                '-y', output_path
-            ]
+            # Add file extension
+            if '.' in file_name:
+                metadata['file_ext'] = '.' + file_name.split('.')[-1]
+            else:
+                metadata['file_ext'] = '.mp4'
             
-            logger.info(f"Running FFmpeg: {' '.join(cmd)}")
-            
-            # Run FFmpeg
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                error_msg = stderr.decode() if stderr else "Unknown error"
-                raise Exception(f"FFmpeg failed: {error_msg[:200]}")
-            
-            return True
+            return metadata
             
         except Exception as e:
-            logger.error(f"Processing error: {str(e)}")
-            raise
+            logger.error(f"Error extracting metadata: {str(e)}")
+            return None
+    
+    @staticmethod
+    def store_metadata_in_github(metadata, youtube_title):
+        """Store file metadata directly in GitHub repository"""
+        try:
+            if not GITHUB_TOKEN or not GITHUB_REPO:
+                return None, "GitHub credentials not configured"
+            
+            headers = {
+                'Authorization': f'token {GITHUB_TOKEN}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            # Create unique file hash for this upload
+            unique_hash = hashlib.md5(
+                f"{metadata['file_id']}{metadata['access_hash']}{time.time()}".encode()
+            ).hexdigest()[:12]
+            
+            metadata_file_name = f"telegram_file_{unique_hash}.json"
+            
+            # Prepare metadata content
+            metadata_content = {
+                'telegram_file': metadata,
+                'title': youtube_title,
+                'created_at': datetime.now().isoformat(),
+                'expires_at': int(time.time()) + 86400  # 24 hours expiry
+            }
+            
+            content_json = json.dumps(metadata_content, indent=2)
+            content_b64 = base64.b64encode(content_json.encode()).decode()
+            
+            # Store in metadata directory
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/telegram_metadata/{metadata_file_name}"
+            
+            data = {
+                'message': f'Telegram file metadata: {youtube_title}',
+                'content': content_b64,
+                'branch': 'main'
+            }
+            
+            response = requests.put(url, headers=headers, json=data)
+            
+            if response.status_code in [200, 201]:
+                # Return the raw URL and file hash for workflow
+                raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/telegram_metadata/{metadata_file_name}"
+                return unique_hash, raw_url
+            else:
+                error_msg = f"Failed to store metadata: {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                return None, error_msg
+                
+        except Exception as e:
+            error_msg = f"Error storing metadata: {str(e)}"
+            logger.error(error_msg)
+            return None, error_msg
 
 class GitHubWorkflowHandler:
+    """Handler for triggering GitHub workflows with Telegram metadata"""
+    
     @staticmethod
-    async def trigger_workflow(video_url, playback_speed, split_timestamps, release_name, video_title):
-        """Trigger GitHub workflow with given parameters."""
+    async def trigger_telegram_workflow(file_hash, metadata_url, playback_speed, 
+                                       split_timestamps, release_name, video_title):
+        """Trigger GitHub workflow with Telegram metadata reference"""
         try:
             headers = {
                 'Authorization': f'token {GITHUB_TOKEN}',
                 'Accept': 'application/vnd.github.v3+json'
             }
             
-            # Prepare workflow inputs
-            inputs = {
-                'video_url': video_url,
+            # Encode metadata for workflow input
+            workflow_inputs = {
+                'file_hash': file_hash,
+                'metadata_url': metadata_url,
                 'playback_speed': str(playback_speed),
                 'split_timestamps': split_timestamps or '',
                 'release_name': release_name,
                 'video_title': video_title
             }
             
-            # Trigger workflow
-            url = f'https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/video_processor.yml/dispatches'
+            # Trigger the NEW workflow that handles Telegram downloads
+            url = f'https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/telegram_download_processor.yml/dispatches'
             
             data = {
-                'ref': 'main',  # or your default branch
-                'inputs': inputs
+                'ref': 'main',
+                'inputs': workflow_inputs
             }
+            
+            logger.info(f"Triggering workflow with URL: {url}")
+            logger.info(f"Workflow inputs: {workflow_inputs}")
             
             response = requests.post(url, headers=headers, json=data)
             
             if response.status_code == 204:
-                return True, "✅ Workflow triggered successfully!"
+                return True, "✅ Workflow triggered successfully! The file will be downloaded directly from Telegram."
             else:
                 return False, f"❌ Failed to trigger workflow: {response.status_code} - {response.text}"
                 
         except Exception as e:
-            logger.error(f"GitHub workflow error: {str(e)}")
+            logger.error(f"Workflow trigger error: {str(e)}")
             return False, str(e)
-    
+
     @staticmethod
     def update_youtube_token(refresh_token):
         """Update YouTube refresh token in GitHub secrets."""
@@ -306,6 +349,8 @@ class SystemMonitor:
             logger.error(f"Error getting system specs: {str(e)}")
             return f"❌ Error getting system specs: {str(e)}"
 
+# ... [Keep all other classes: YouTubeAuthHandler, SystemMonitor exactly as before] ...
+
 class TelegramVideoBot:
     def __init__(self):
         self.client = TelegramClient(
@@ -317,13 +362,12 @@ class TelegramVideoBot:
     
     async def start(self):
         """Start the Telegram bot."""
-        print("\n" + "="*50)
-        print("🎬 TELEGRAM VIDEO SPEED BOT")
-        print(f"📁 Max file size: {MAX_FILE_SIZE/(1024**3):.1f}GB")
+        print("\n" + "="*60)
+        print("🎬 TELEGRAM VIDEO BOT - METADATA MODE")
+        print("📁 NO TEMPORARY STORAGE - Direct Telegram download")
         print(f"🌐 Web server port: {PORT}")
-        print("="*50)
+        print("="*60)
         
-        # Connect with session string
         await self.client.start()
         self.me = await self.client.get_me()
         
@@ -331,12 +375,9 @@ class TelegramVideoBot:
         await self.setup_handlers()
         
         print(f"✅ Logged in as: @{self.me.username}")
-        print(f"✅ User ID: {self.me.id}")
-        print("✅ Bot is ready!")
-        print("💬 Send videos to this account")
-        print("="*50)
+        print("✅ Bot is ready! Send videos up to 2GB")
+        print("="*60)
         
-        # Keep running
         await self.client.run_until_disconnected()
     
     async def setup_handlers(self):
@@ -530,8 +571,17 @@ Use /auth_youtube to setup automatic uploads
                 'video' in str(e.document.mime_type).lower()
             )
         ))
+        # ... [Keep ALL your existing handler functions exactly as they were] ...
+        # Only change the final processing function
+        
+        @self.client.on(events.NewMessage(
+            func=lambda e: e.video or (
+                e.document and e.document.mime_type and 
+                'video' in str(e.document.mime_type).lower()
+            )
+        ))
         async def video_handler(event):
-            """Handle incoming videos."""
+            """Handle incoming videos - UPDATED FOR METADATA"""
             user_id = event.sender_id
             
             try:
@@ -550,23 +600,18 @@ Use /auth_youtube to setup automatic uploads
                     await event.reply(f"❌ **File too large!**\nYour file: {file_gb:.1f}GB\nMax: {max_gb:.1f}GB")
                     return
                 
-                # Create temp directory
-                temp_dir = Path(f"/tmp/temp_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-                temp_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Store session
+                # Store session with message reference
                 user_sessions[user_id] = {
-                    'media': media,
+                    'message': event.message,  # Store the message object
                     'file_name': file_name,
-                    'temp_dir': temp_dir,
+                    'file_size': media.size,
                     'chat_id': event.chat_id,
                     'timestamp': datetime.now(),
-                    'step': 'speed',  # Start with speed selection
+                    'step': 'speed',
                     'speed': None,
                     'split_timestamps': None,
                     'youtube_title': None,
-                    'github_title': None,
-                    'video_url': None
+                    'github_title': None
                 }
                 
                 # Send speed selection buttons
@@ -581,7 +626,7 @@ Use /auth_youtube to setup automatic uploads
             except Exception as e:
                 logger.error(f"Video handler error: {str(e)}")
                 await event.reply(f"❌ Error: {str(e)[:200]}")
-        
+
         @self.client.on(events.NewMessage)
         async def text_handler(event):
             """Handle text messages for workflow inputs."""
@@ -704,6 +749,7 @@ Use /auth_youtube to setup automatic uploads
                     pass
                 self.cleanup_user_session(user_id)
     
+    # ... [Keep ALL other handlers: callback_handler, text_handler, etc.] ...
     def validate_timestamps(self, timestamps):
         """Validate HH:MM:SS format."""
         if not timestamps:
@@ -721,63 +767,41 @@ Use /auth_youtube to setup automatic uploads
         return False
     
     async def start_workflow_processing(self, user_id, event):
-        """Start processing and trigger GitHub workflow."""
+        """Start workflow processing USING METADATA ONLY"""
         try:
             session = user_sessions[user_id]
             
             # Create progress message
-            progress_msg = await event.reply("⚙️ **Starting processing...**")
+            progress_msg = await event.reply("🔍 **Extracting file information...**")
             
-            # Step 1: Download video to bot server
-            await progress_msg.edit("📥 **Downloading video from Telegram...**")
+            # Step 1: Extract metadata WITHOUT downloading
+            await progress_msg.edit("📋 **Getting Telegram file metadata...**")
             
-            temp_dir = session['temp_dir']
-            input_path = temp_dir / "original_video.mp4"
+            metadata = FileMetadataHandler.extract_file_metadata(session['message'])
             
-            last_percent = -5
+            if not metadata:
+                await progress_msg.edit("❌ **Failed to extract file information**")
+                self.cleanup_user_session(user_id)
+                return
             
-            def progress_callback(current, total):
-                nonlocal last_percent
-                percent = (current / total) * 100
-                if percent - last_percent >= 5 or current == total:
-                    asyncio.create_task(
-                        progress_msg.edit(
-                            f"📥 **Downloading...**\n"
-                            f"Progress: {percent:.1f}%\n"
-                            f"Size: {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB"
-                        )
-                    )
-                    last_percent = percent
+            # Step 2: Store metadata in GitHub
+            await progress_msg.edit("💾 **Storing metadata in GitHub...**")
             
-            await self.client.download_media(
-                session['media'],
-                file=input_path,
-                progress_callback=progress_callback
+            file_hash, metadata_url = FileMetadataHandler.store_metadata_in_github(
+                metadata, session['youtube_title']
             )
             
-            # Step 2: Upload to transfer.sh for temporary storage
-            await progress_msg.edit("☁️ **Uploading to temporary storage...**")
+            if not file_hash:
+                await progress_msg.edit(f"❌ **Failed to store metadata:**\n{metadata_url}")
+                self.cleanup_user_session(user_id)
+                return
             
-            upload_url = await self.upload_to_transfersh(input_path, session['file_name'])
-            
-            if not upload_url:
-                # Try alternative: file.io
-                upload_url = await self.upload_to_fileio(input_path)
-            
-            if not upload_url:
-                # Last resort: Upload to GitHub as a gist or file
-                upload_url = await self.upload_to_github_temp(input_path, session['file_name'])
-            
-            if not upload_url:
-                raise Exception("Failed to upload video to temporary storage")
-            
-            session['video_url'] = upload_url
-            
-            # Step 3: Trigger GitHub workflow
+            # Step 3: Trigger workflow with metadata
             await progress_msg.edit("🚀 **Triggering GitHub workflow...**")
             
-            success, message = await GitHubWorkflowHandler.trigger_workflow(
-                video_url=upload_url,
+            success, message = await GitHubWorkflowHandler.trigger_telegram_workflow(
+                file_hash=file_hash,
+                metadata_url=metadata_url,
                 playback_speed=session['speed'],
                 split_timestamps=session.get('split_timestamps', ''),
                 release_name=session['github_title'],
@@ -786,17 +810,20 @@ Use /auth_youtube to setup automatic uploads
             
             if success:
                 await progress_msg.edit(
-                    f"✅ **Workflow triggered successfully!**\n\n"
+                    f"✅ **Processing started!**\n\n"
                     f"**Details:**\n"
                     f"• Speed: {session['speed']}x\n"
-                    f"• YouTube Title: {session['youtube_title']}\n"
+                    f"• YouTube: {session['youtube_title']}\n"
                     f"• GitHub Release: {session['github_title']}\n"
-                    f"• Splits: {session.get('split_timestamps', 'No splits')}\n\n"
-                    f"📊 Check workflow status with /workflow_status\n"
-                    f"📺 Videos will be uploaded to YouTube and GitHub Releases."
+                    f"• File Hash: `{file_hash}`\n\n"
+                    f"📡 **Workflow will:**\n"
+                    f"1. Download directly from Telegram\n"
+                    f"2. Process at {session['speed']}x speed\n"
+                    f"3. Upload to YouTube & GitHub Releases\n\n"
+                    f"Check status with /workflow_status"
                 )
             else:
-                await progress_msg.edit(f"❌ **Failed to trigger workflow:**\n{message}")
+                await progress_msg.edit(f"❌ **Failed:**\n{message}")
             
             # Cleanup
             self.cleanup_user_session(user_id)
@@ -806,103 +833,10 @@ Use /auth_youtube to setup automatic uploads
             await progress_msg.edit(f"❌ **Error:** {str(e)[:500]}")
             self.cleanup_user_session(user_id)
     
-    async def upload_to_transfersh(self, file_path, file_name):
-        """Upload file to transfer.sh for temporary storage."""
-        try:
-            import aiohttp
-            
-            async with aiohttp.ClientSession() as session:
-                with open(file_path, 'rb') as f:
-                    data = aiohttp.FormData()
-                    data.add_field('file', f, filename=file_name)
-                    
-                    async with session.post('https://transfer.sh', data=data) as response:
-                        if response.status == 200:
-                            return (await response.text()).strip()
-            return None
-            
-        except Exception as e:
-            logger.error(f"transfer.sh upload error: {str(e)}")
-            return None
-    
-    async def upload_to_fileio(self, file_path):
-        """Upload file to file.io (max 2GB, 14 days)."""
-        try:
-            import aiohttp
-            
-            async with aiohttp.ClientSession() as session:
-                with open(file_path, 'rb') as f:
-                    data = aiohttp.FormData()
-                    data.add_field('file', f, filename=os.path.basename(file_path))
-                    
-                    async with session.post('https://file.io', data=data) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            if result.get('success'):
-                                return result['link']
-            return None
-            
-        except Exception as e:
-            logger.error(f"file.io upload error: {str(e)}")
-            return None
-    
-    async def upload_to_github_temp(self, file_path, file_name):
-        """Upload file to GitHub as a temporary file."""
-        try:
-            if not GITHUB_TOKEN or not GITHUB_REPO:
-                return None
-            
-            # Read file content
-            with open(file_path, 'rb') as f:
-                content = f.read()
-            
-            # Encode to base64
-            content_b64 = base64.b64encode(content).decode()
-            
-            # Create a unique filename
-            file_hash = hashlib.md5(content).hexdigest()[:12]
-            unique_filename = f"video_{file_hash}.mp4"
-            
-            headers = {
-                'Authorization': f'token {GITHUB_TOKEN}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-            
-            # Upload to a temporary directory in the repo
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/temp_uploads/{unique_filename}"
-            
-            data = {
-                'message': f'Upload video for processing: {file_name}',
-                'content': content_b64,
-                'branch': 'main'
-            }
-            
-            response = requests.put(url, headers=headers, json=data)
-            
-            if response.status_code in [200, 201]:
-                return f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/temp_uploads/{unique_filename}"
-            else:
-                logger.error(f"GitHub upload failed: {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"GitHub upload error: {str(e)}")
-            return None
-    
     def cleanup_user_session(self, user_id):
-        """Clean up user's temporary files."""
+        """Clean up user session - NO FILES TO DELETE"""
         try:
             if user_id in user_sessions:
-                session = user_sessions[user_id]
-                temp_dir = session.get('temp_dir')
-                
-                if temp_dir and temp_dir.exists():
-                    # Try to remove directory
-                    try:
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                    except:
-                        pass
-                
                 del user_sessions[user_id]
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
@@ -1027,3 +961,5 @@ async def main():
 if __name__ == '__main__':
     # Run the application
     asyncio.run(main())
+
+# ... [Keep all web server and main functions exactly as before] ...
