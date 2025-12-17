@@ -557,7 +557,7 @@ Use /auth_youtube to setup automatic uploads
                 # Store session
                 user_sessions[user_id] = {
                     'media': media,
-                    'file_name': fille_name,
+                    'file_name': file_name,
                     'temp_dir': temp_dir,
                     'chat_id': event.chat_id,
                     'timestamp': datetime.now(),
@@ -806,7 +806,7 @@ Use /auth_youtube to setup automatic uploads
             await progress_msg.edit(f"❌ **Error:** {str(e)[:500]}")
             self.cleanup_user_session(user_id)
     
-    async def upload_to_transfersh(self, file_path, filename):
+    async def upload_to_transfersh(self, file_path, file_name):
         """Upload file to transfer.sh for temporary storage."""
         try:
             import aiohttp
@@ -814,7 +814,7 @@ Use /auth_youtube to setup automatic uploads
             async with aiohttp.ClientSession() as session:
                 with open(file_path, 'rb') as f:
                     data = aiohttp.FormData()
-                    data.add_field('file', f, filename=filename)
+                    data.add_field('file', f, filename=file_name)
                     
                     async with session.post('https://transfer.sh', data=data) as response:
                         if response.status == 200:
@@ -846,7 +846,7 @@ Use /auth_youtube to setup automatic uploads
             logger.error(f"file.io upload error: {str(e)}")
             return None
     
-    async def upload_to_github_temp(self, file_path, filename):
+    async def upload_to_github_temp(self, file_path, file_name):
         """Upload file to GitHub as a temporary file."""
         try:
             if not GITHUB_TOKEN or not GITHUB_REPO:
@@ -872,7 +872,7 @@ Use /auth_youtube to setup automatic uploads
             url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/temp_uploads/{unique_filename}"
             
             data = {
-                'message': f'Upload video for processing: {filename}',
+                'message': f'Upload video for processing: {file_name}',
                 'content': content_b64,
                 'branch': 'main'
             }
@@ -907,7 +907,6 @@ Use /auth_youtube to setup automatic uploads
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
 
-# Web server functions
 async def handle_health(request):
     """Health check endpoint."""
     return web.Response(text="✅ Bot is running!")
