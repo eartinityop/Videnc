@@ -57,44 +57,21 @@ class FileMetadataHandler:
     """Handles extraction and storage of Telegram file metadata"""
     
     @staticmethod
-    def extract_file_metadata(message):
-        """Extract all necessary metadata from Telegram message without downloading"""
+    def extract_file_metadata(message_dict):
+        """
+        Extract metadata from already-stored dictionary.
+        This is now just a passthrough since we extract metadata immediately.
+        """
         try:
-            if message.video:
-                media = message.video
-                file_name = media.file_name or "video.mp4"
-                mime_type = "video/mp4"
-            elif message.document:
-                media = message.document
-                file_name = media.file_name or "video.mp4"
-                mime_type = media.mime_type or "video/mp4"
-            else:
+            # The metadata is already extracted in video_handler
+            # Just validate and return it
+            if not message_dict or 'file_id' not in message_dict:
                 return None
             
-            # Get essential Telegram file identifiers
-            metadata = {
-                'file_id': media.id,
-                'access_hash': media.access_hash,
-                'file_reference': media.file_reference.hex() if media.file_reference else '',
-                'dc_id': media.dc_id,
-                'size': media.size,
-                'mime_type': mime_type,
-                'file_name': file_name,
-                'chat_id': message.chat_id,
-                'message_id': message.id,
-                'timestamp': int(time.time())
-            }
-            
-            # Add file extension
-            if '.' in file_name:
-                metadata['file_ext'] = '.' + file_name.split('.')[-1]
-            else:
-                metadata['file_ext'] = '.mp4'
-            
-            return metadata
+            return message_dict
             
         except Exception as e:
-            logger.error(f"Error extracting metadata: {str(e)}")
+            logger.error(f"Error validating metadata: {str(e)}")
             return None
     
     @staticmethod
@@ -196,49 +173,6 @@ class GitHubWorkflowHandler:
         except Exception as e:
             logger.error(f"Workflow trigger error: {str(e)}")
             return False, str(e)
-
-    @staticmethod
-    def update_youtube_token(refresh_token):
-        """Update YouTube refresh token in GitHub secrets."""
-        try:
-            # Get public key for secrets
-            headers = {
-                'Authorization': f'token {GITHUB_TOKEN}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-            
-            # Get public key
-            pk_url = f'https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/public-key'
-            pk_response = requests.get(pk_url, headers=headers)
-            
-            if pk_response.status_code != 200:
-                return False
-            
-            pk_data = pk_response.json()
-            key_id = pk_data['key_id']
-            public_key = pk_data['key']
-            
-            # Encrypt the secret using libsodium
-            from nacl.public import PublicKey, SealedBox
-            public_key_obj = PublicKey(base64.b64decode(public_key))
-            sealed_box = SealedBox(public_key_obj)
-            encrypted = sealed_box.encrypt(refresh_token.encode())
-            encrypted_b64 = base64.b64encode(encrypted).decode()
-            
-            # Update secret
-            secret_url = f'https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/YOUTUBE_REFRESH_TOKEN'
-            data = {
-                'encrypted_value': encrypted_b64,
-                'key_id': key_id
-            }
-            
-            response = requests.put(secret_url, headers=headers, json=data)
-            
-            return response.status_code == 204
-            
-        except Exception as e:
-            logger.error(f"Failed to update YouTube token: {str(e)}")
-            return False
 
 class YouTubeAuthHandler:
     @staticmethod
@@ -349,8 +283,6 @@ class SystemMonitor:
             logger.error(f"Error getting system specs: {str(e)}")
             return f"❌ Error getting system specs: {str(e)}"
 
-# ... [Keep all other classes: YouTubeAuthHandler, SystemMonitor exactly as before] ...
-
 class TelegramVideoBot:
     def __init__(self):
         self.client = TelegramClient(
@@ -432,8 +364,8 @@ class TelegramVideoBot:
 3. Enter split timestamps (HH:MM:SS,HH:MM:SS)
 4. Enter YouTube title
 5. Enter GitHub release title
-6. Bot downloads and uploads to GitHub
-7. Bot triggers GitHub workflow
+6. Bot triggers GitHub workflow
+7. Workflow downloads directly from Telegram
 
 **Split Format:** 01:30:00,02:45:00,03:15:00
 
@@ -571,27 +503,22 @@ Use /auth_youtube to setup automatic uploads
                 'video' in str(e.document.mime_type).lower()
             )
         ))
-        # ... [Keep ALL your existing handler functions exactly as they were] ...
-        # Only change the final processing function
-        
-        @self.client.on(events.NewMessage(
-            func=lambda e: e.video or (
-                e.document and e.document.mime_type and 
-                'video' in str(e.document.mime_type).lower()
-            )
-        ))
         async def video_handler(event):
-            """Handle incoming videos - UPDATED FOR METADATA"""
+            """Handle incoming videos - EXTRACT METADATA IMMEDIATELY"""
             user_id = event.sender_id
             
             try:
                 # Get video info
                 if event.video:
                     media = event.video
-                    file_name = "video.mp4"
-                else:
+                    file_name = media.file_name or "video.mp4"
+                    mime_type = "video/mp4"
+                elif event.document:
                     media = event.document
                     file_name = media.file_name or "video.mp4"
+                    mime_type = media.mime_type or "video/mp4"
+                else:
+                    return
                 
                 # Check file size
                 if media.size > MAX_FILE_SIZE:
@@ -600,10 +527,23 @@ Use /auth_youtube to setup automatic uploads
                     await event.reply(f"❌ **File too large!**\nYour file: {file_gb:.1f}GB\nMax: {max_gb:.1f}GB")
                     return
                 
-                # Store session with message reference
-                user_sessions[user_id] = {
-                    'message': event.message,  # Store the message object
+                # EXTRACT AND STORE CRITICAL METADATA IMMEDIATELY
+                file_metadata = {
+                    'file_id': media.id,
+                    'access_hash': media.access_hash,
+                    'file_reference': media.file_reference.hex() if media.file_reference else '',
+                    'dc_id': media.dc_id,
+                    'size': media.size,
+                    'mime_type': mime_type,
                     'file_name': file_name,
+                    'original_message_id': event.message.id,
+                    'chat_id': event.chat_id,
+                    'extracted_at': int(time.time())
+                }
+                
+                # Store session with METADATA (not the message object)
+                user_sessions[user_id] = {
+                    'file_metadata': file_metadata,  # Store extracted metadata
                     'file_size': media.size,
                     'chat_id': event.chat_id,
                     'timestamp': datetime.now(),
@@ -626,7 +566,7 @@ Use /auth_youtube to setup automatic uploads
             except Exception as e:
                 logger.error(f"Video handler error: {str(e)}")
                 await event.reply(f"❌ Error: {str(e)[:200]}")
-
+        
         @self.client.on(events.NewMessage)
         async def text_handler(event):
             """Handle text messages for workflow inputs."""
@@ -749,7 +689,6 @@ Use /auth_youtube to setup automatic uploads
                     pass
                 self.cleanup_user_session(user_id)
     
-    # ... [Keep ALL other handlers: callback_handler, text_handler, etc.] ...
     def validate_timestamps(self, timestamps):
         """Validate HH:MM:SS format."""
         if not timestamps:
@@ -767,22 +706,22 @@ Use /auth_youtube to setup automatic uploads
         return False
     
     async def start_workflow_processing(self, user_id, event):
-        """Start workflow processing USING METADATA ONLY"""
+        """Start workflow processing USING ALREADY-EXTRACTED METADATA"""
         try:
             session = user_sessions[user_id]
             
             # Create progress message
-            progress_msg = await event.reply("🔍 **Extracting file information...**")
+            progress_msg = await event.reply("🔍 **Preparing workflow...**")
             
-            # Step 1: Extract metadata WITHOUT downloading
-            await progress_msg.edit("📋 **Getting Telegram file metadata...**")
+            # Step 1: Use ALREADY EXTRACTED metadata
+            await progress_msg.edit("📋 **Using extracted file metadata...**")
             
-            metadata = FileMetadataHandler.extract_file_metadata(session['message'])
-            
-            if not metadata:
-                await progress_msg.edit("❌ **Failed to extract file information**")
+            if 'file_metadata' not in session:
+                await progress_msg.edit("❌ **No file metadata found! Please send the video again.**")
                 self.cleanup_user_session(user_id)
                 return
+            
+            metadata = session['file_metadata']
             
             # Step 2: Store metadata in GitHub
             await progress_msg.edit("💾 **Storing metadata in GitHub...**")
@@ -841,6 +780,7 @@ Use /auth_youtube to setup automatic uploads
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
 
+# Web server functions
 async def handle_health(request):
     """Health check endpoint."""
     return web.Response(text="✅ Bot is running!")
@@ -961,5 +901,4 @@ async def main():
 if __name__ == '__main__':
     # Run the application
     asyncio.run(main())
-
-# ... [Keep all web server and main functions exactly as before] ...
+       
